@@ -1,15 +1,10 @@
+from importlib.metadata import version
+
+
 def _get_version() -> str:
     try:
-        try:
-            from importlib.metadata import version
-        except ImportError:
-            pass
-        else:
-            return version("cog")
-        import pkg_resources
-
-        return pkg_resources.get_distribution("cog").version
-    except Exception:
+        return version("cog")
+    except Exception:  # pylint: disable=broad-exception-caught
         return "unknown"
 
 

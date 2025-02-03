@@ -6,11 +6,29 @@ import shutil
 import tempfile
 import urllib.parse
 import urllib.request
-from typing import Any, Dict, Iterator, List, Optional, TypeVar, Union
+import urllib.response
+from typing import (
+    Any,
+    AsyncIterator,
+    Dict,
+    Iterator,
+    List,
+    Optional,
+    Type,
+    TypedDict,
+    TypeVar,
+    Union,
+)
 
+import pydantic
 import requests
-from pydantic import Field, SecretStr
-from typing_extensions import NotRequired, TypedDict
+from typing_extensions import NotRequired  # added to typing in python 3.11
+
+if pydantic.__version__.startswith("1."):
+    PYDANTIC_V2 = False
+else:
+    PYDANTIC_V2 = True
+
 
 FILENAME_ILLEGAL_CHARS = set("\u0000/")
 
@@ -20,14 +38,19 @@ FILENAME_ILLEGAL_CHARS = set("\u0000/")
 FILENAME_MAX_LENGTH = 200
 
 
-class CogConfig(TypedDict):
+class ExperimentalFeatureWarning(Warning):
+    pass
+
+
+class CogConfig(TypedDict):  # pylint: disable=too-many-ancestors
     build: "CogBuildConfig"
+    concurrency: "CogConcurrencyConfig"
     image: NotRequired[str]
     predict: NotRequired[str]
     train: NotRequired[str]
 
 
-class CogBuildConfig(TypedDict, total=False):
+class CogBuildConfig(TypedDict, total=False):  # pylint: disable=too-many-ancestors
     cuda: Optional[str]
     gpu: Optional[bool]
     python_packages: Optional[List[str]]
@@ -37,40 +60,74 @@ class CogBuildConfig(TypedDict, total=False):
     run: Optional[Union[List[str], List[Dict[str, Any]]]]
 
 
-def Input(
+class CogConcurrencyConfig(TypedDict, total=False):  # pylint: disable=too-many-ancestors
+    max: NotRequired[int]
+
+
+def Input(  # pylint: disable=invalid-name, too-many-arguments
     default: Any = ...,
-    description: str = None,
-    ge: float = None,
-    le: float = None,
-    min_length: int = None,
-    max_length: int = None,
-    regex: str = None,
-    choices: List[Union[str, int]] = None,
+    description: Optional[str] = None,
+    ge: Optional[float] = None,
+    le: Optional[float] = None,
+    min_length: Optional[int] = None,
+    max_length: Optional[int] = None,
+    regex: Optional[str] = None,
+    choices: Optional[List[Union[str, int]]] = None,
 ) -> Any:
     """Input is similar to pydantic.Field, but doesn't require a default value to be the first argument."""
-    return Field(
-        default,
-        description=description,
-        ge=ge,
-        le=le,
-        min_length=min_length,
-        max_length=max_length,
-        regex=regex,
-        choices=choices,
-    )
+    field_kwargs = {
+        "default": default,
+        "description": description,
+        "ge": ge,
+        "le": le,
+        "min_length": min_length,
+        "max_length": max_length,
+    }
+
+    if PYDANTIC_V2:
+        field_kwargs["pattern"] = regex
+        if choices:
+            # The `choices` parameter is deprecated in Pydantic v2.
+            # Instead, the user should use `Literal[...]`
+            # to specify the allowed values.
+            field_kwargs["json_schema_extra"] = {"enum": choices}
+    else:
+        field_kwargs["regex"] = regex
+        field_kwargs["enum"] = choices
+    return pydantic.Field(**field_kwargs)
 
 
-class Secret(SecretStr):
-    @classmethod
-    def __modify_schema__(cls, field_schema: Dict[str, Any]) -> None:
-        """Defines what this type should be in openapi.json"""
-        field_schema.update(
-            {
-                "type": "string",
-                "format": "password",
-                "x-cog-secret": True,
-            }
-        )
+class Secret(pydantic.SecretStr):
+    if PYDANTIC_V2:
+        from pydantic.json_schema import JsonSchemaValue
+        from pydantic_core import CoreSchema
+
+        @classmethod
+        def __get_pydantic_json_schema__(
+            cls, core_schema: CoreSchema, handler: Any
+        ) -> JsonSchemaValue:
+            json_schema = handler(core_schema)
+            json_schema.update(
+                {
+                    "type": "string",
+                    "format": "password",
+                    "x-cog-secret": True,
+                }
+            )
+            return json_schema
+
+    else:
+
+        @classmethod
+        def __modify_schema__(cls, field_schema: Dict[str, Any]) -> None:
+            """Defines what this type should be in openapi.json"""
+            field_schema.update(
+                {
+                    "type": "string",
+                    "format": "password",
+                    "x-cog-secret": True,
+                }
+            )
 
 
 class File(io.IOBase):
@@ -79,38 +136,64 @@ class File(io.IOBase):
     validate_always = True
 
     @classmethod
-    def __get_validators__(cls) -> Iterator[Any]:
-        yield cls.validate
-
-    @classmethod
     def validate(cls, value: Any) -> io.IOBase:
         if isinstance(value, io.IOBase):
             return value
 
         parsed_url = urllib.parse.urlparse(value)
         if parsed_url.scheme == "data":
-            res = urllib.request.urlopen(value)  # noqa: S310
-            return io.BytesIO(res.read())
-        elif parsed_url.scheme == "http" or parsed_url.scheme == "https":
+            with urllib.request.urlopen(value) as res:  # noqa: S310
+                return io.BytesIO(res.read())
+        if parsed_url.scheme in ("http", "https"):
             return URLFile(value)
-        else:
-            raise ValueError(
-                f"'{parsed_url.scheme}' is not a valid URL scheme. 'data', 'http', or 'https' is supported."
+        raise ValueError(
+            f"'{parsed_url.scheme}' is not a valid URL scheme. 'data', 'http', or 'https' is supported."
+        )
+
+    if PYDANTIC_V2:
+        from pydantic import GetCoreSchemaHandler, TypeAdapter
+        from pydantic_core.core_schema import CoreSchema
+
+        @classmethod
+        def __get_pydantic_core_schema__(
+            cls,
+            source: Type[Any],  # pylint: disable=unused-argument
+            handler: "pydantic.GetCoreSchemaHandler",  # pylint: disable=unused-argument
+        ) -> "CoreSchema":
+            from pydantic_core import (  # pylint: disable=import-outside-toplevel
+                core_schema,
             )
 
-    @classmethod
-    def __modify_schema__(cls, field_schema: Dict[str, Any]) -> None:
-        """Defines what this type should be in openapi.json"""
-        # https://json-schema.org/understanding-json-schema/reference/string.html#uri-template
-        field_schema.update(type="string", format="uri")
+            return core_schema.union_schema(
+                [
+                    core_schema.is_instance_schema(io.IOBase),
+                    core_schema.no_info_plain_validator_function(cls.validate),
+                ]
+            )
+
+        @classmethod
+        def __get_pydantic_json_schema__(
+            cls, core_schema: "CoreSchema", handler: "pydantic.GetJsonSchemaHandler"
+        ) -> "JsonSchemaValue":  # type: ignore # noqa: F821
+            json_schema = handler(core_schema)
+            json_schema.update(type="string", format="uri")
+            return json_schema
+
+    else:
+
+        @classmethod
+        def __get_validators__(cls) -> Iterator[Any]:
+            yield cls.validate
+
+        @classmethod
+        def __modify_schema__(cls, field_schema: Dict[str, Any]) -> None:
+            """Defines what this type should be in openapi.json"""
+            # https://json-schema.org/understanding-json-schema/reference/string.html#uri-template
+            field_schema.update(type="string", format="uri")
 
 
-class Path(pathlib.PosixPath):
+class Path(pathlib.PosixPath):  # pylint: disable=abstract-method
     validate_always = True
-
-    @classmethod
-    def __get_validators__(cls) -> Iterator[Any]:
-        yield cls.validate
 
     @classmethod
     def validate(cls, value: Any) -> pathlib.Path:
@@ -123,14 +206,50 @@ class Path(pathlib.PosixPath):
             fileobj=File.validate(value),
         )
 
-    @classmethod
-    def __modify_schema__(cls, field_schema: Dict[str, Any]) -> None:
-        """Defines what this type should be in openapi.json"""
-        # https://json-schema.org/understanding-json-schema/reference/string.html#uri-template
-        field_schema.update(type="string", format="uri")
+    if PYDANTIC_V2:
+        from pydantic import GetCoreSchemaHandler
+        from pydantic.json_schema import JsonSchemaValue
+        from pydantic_core import CoreSchema
+
+        @classmethod
+        def __get_pydantic_core_schema__(
+            cls,
+            source: Type[Any],  # pylint: disable=unused-argument
+            handler: "pydantic.GetCoreSchemaHandler",  # pylint: disable=unused-argument
+        ) -> "CoreSchema":
+            from pydantic_core import (  # pylint: disable=import-outside-toplevel
+                core_schema,
+            )
+
+            return core_schema.union_schema(
+                [
+                    core_schema.is_instance_schema(pathlib.Path),
+                    core_schema.no_info_plain_validator_function(cls.validate),
+                ]
+            )
+
+        @classmethod
+        def __get_pydantic_json_schema__(
+            cls, core_schema: "CoreSchema", handler: "pydantic.GetJsonSchemaHandler"
+        ) -> "JsonSchemaValue":  # type: ignore # noqa: F821
+            json_schema = handler(core_schema)
+            json_schema.update(type="string", format="uri")
+            return json_schema
+
+    else:
+
+        @classmethod
+        def __get_validators__(cls) -> Iterator[Any]:
+            yield cls.validate
+
+        @classmethod
+        def __modify_schema__(cls, field_schema: Dict[str, Any]) -> None:
+            """Defines what this type should be in openapi.json"""
+            # https://json-schema.org/understanding-json-schema/reference/string.html#uri-template
+            field_schema.update(type="string", format="uri")
 
 
-class URLPath(pathlib.PosixPath):
+class URLPath(pathlib.PosixPath):  # pylint: disable=abstract-method
     """
     URLPath is a nasty hack to ensure that we can defer the downloading of a
     URL passed as a path until later in prediction dispatch.
@@ -141,7 +260,10 @@ class URLPath(pathlib.PosixPath):
 
     _path: Optional[Path]
 
-    def __init__(self, *, source: str, filename: str, fileobj: io.IOBase) -> None:
+    def __init__(self, *, source: str, filename: str, fileobj: io.IOBase) -> None:  # pylint: disable=super-init-not-called
+        if len(filename) > FILENAME_MAX_LENGTH:
+            filename = _truncate_filename_bytes(filename, FILENAME_MAX_LENGTH)
+
         self.source = source
         self.filename = filename
         self.fileobj = fileobj
@@ -150,7 +272,7 @@ class URLPath(pathlib.PosixPath):
 
     def convert(self) -> Path:
         if self._path is None:
-            dest = tempfile.NamedTemporaryFile(suffix=self.filename, delete=False)
+            dest = tempfile.NamedTemporaryFile(suffix=self.filename, delete=False)  # pylint: disable=consider-using-with
             shutil.copyfileobj(self.fileobj, dest)
             self._path = Path(dest.name)
         return self._path
@@ -172,17 +294,54 @@ class URLFile(io.IOBase):
     URL that can survive pickling/unpickling.
     """
 
-    __slots__ = ("__target__", "__url__")
+    __slots__ = ("__target__", "__url__", "name")
 
-    def __init__(self, url: str) -> None:
+    def __init__(self, url: str, filename: Optional[str] = None) -> None:
+        parsed = urllib.parse.urlparse(url)
+        if parsed.scheme not in {
+            "http",
+            "https",
+        }:
+            raise ValueError(
+                "URLFile requires URL to conform to HTTP or HTTPS protocol"
+            )
+        object.__setattr__(self, "name", os.path.basename(parsed.path))
         object.__setattr__(self, "__url__", url)
+
+        if parsed.scheme not in {
+            "http",
+            "https",
+        }:
+            raise ValueError(
+                "URLFile requires URL to conform to HTTP or HTTPS protocol"
+            )
+
+        if not filename:
+            filename = os.path.basename(parsed.path)
+
+        object.__setattr__(self, "name", filename)
+        object.__setattr__(self, "__url__", url)
+
+    def __del__(self) -> None:
+        try:
+            object.__getattribute__(self, "__target__")
+        except AttributeError:
+            # Do nothing when tearing down the object if the response object
+            # hasn't been created yet.
+            return
+
+        super().__del__()
 
     # We provide __getstate__ and __setstate__ explicitly to ensure that the
     # object is always picklable.
     def __getstate__(self) -> Dict[str, Any]:
-        return {"url": object.__getattribute__(self, "__url__")}
+        return {
+            "name": object.__getattribute__(self, "name"),
+            "url": object.__getattribute__(self, "__url__"),
+        }
 
     def __setstate__(self, state: Dict[str, Any]) -> None:
+        object.__setattr__(self, "name", state["name"])
         object.__setattr__(self, "__url__", state["url"])
 
     # Proxy getattr/setattr/delattr through to the response object.
@@ -195,8 +354,9 @@ class URLFile(io.IOBase):
     def __getattr__(self, name: str) -> Any:
         if name in ("__target__", "__wrapped__", "__url__"):
             raise AttributeError(name)
-        else:
-            return getattr(self.__wrapped__, name)
+        elif name == "name":
+            return object.__getattribute__(self, "name")
+        return getattr(self.__wrapped__, name)
 
     def __delattr__(self, name: str) -> None:
         if hasattr(type(self), name):
@@ -213,34 +373,33 @@ class URLFile(io.IOBase):
         try:
             return object.__getattribute__(self, "__target__")
         except AttributeError:
-            url = object.__getattribute__(self, "__url__")
-            resp = requests.get(url, stream=True)
-            resp.raise_for_status()
-            resp.raw.decode_content = True
-            object.__setattr__(self, "__target__", resp.raw)
-            return resp.raw
+            pass
+        url = object.__getattribute__(self, "__url__")
+        resp = requests.get(url, stream=True, timeout=10)
+        resp.raise_for_status()
+        resp.raw.decode_content = True
+        object.__setattr__(self, "__target__", resp.raw)
+        return resp.raw
 
     def __repr__(self) -> str:
         try:
             target = object.__getattribute__(self, "__target__")
         except AttributeError:
-            return "<{} at 0x{:x} for {!r}>".format(
-                type(self).__name__, id(self), object.__getattribute__(self, "__url__")
-            )
-        else:
-            return f"<{type(self).__name__} at 0x{id(self):x} wrapping {target!r}>"
+            return f"<{type(self).__name__} at 0x{id(self):x} for {object.__getattribute__(self, '__url__')!r}>"
+
+        return f"<{type(self).__name__} at 0x{id(self):x} wrapping {target!r}>"
 
 
 def get_filename(url: str) -> str:
     parsed_url = urllib.parse.urlparse(url)
 
     if parsed_url.scheme == "data":
-        resp = urllib.request.urlopen(url)  # noqa: S310
-        mime_type = resp.headers.get_content_type()
-        extension = mimetypes.guess_extension(mime_type)
-        if extension is None:
-            return "file"
-        return "file" + extension
+        with urllib.request.urlopen(url) as resp:  # noqa: S310
+            mime_type = resp.headers.get_content_type()
+            extension = mimetypes.guess_extension(mime_type)
+            if extension is None:
+                return "file"
+            return "file" + extension
 
     basename = os.path.basename(parsed_url.path)
     basename = urllib.parse.unquote_plus(basename)
@@ -260,29 +419,118 @@ def get_filename(url: str) -> str:
 
 
 Item = TypeVar("Item")
+_concatenate_iterator_schema = {
+    "type": "array",
+    "items": {"type": "string"},
+    "x-cog-array-type": "iterator",
+    "x-cog-array-display": "concatenate",
+}
 
 
-class ConcatenateIterator(Iterator[Item]):
-    @classmethod
-    def __modify_schema__(cls, field_schema: Dict[str, Any]) -> None:
-        """Defines what this type should be in openapi.json"""
-        field_schema.pop("allOf", None)
-        field_schema.update(
-            {
-                "type": "array",
-                "items": {"type": "string"},
-                "x-cog-array-type": "iterator",
-                "x-cog-array-display": "concatenate",
-            }
-        )
-
-    @classmethod
-    def __get_validators__(cls) -> Iterator[Any]:
-        yield cls.validate
-
+class ConcatenateIterator(Iterator[Item]):  # pylint: disable=abstract-method
     @classmethod
     def validate(cls, value: Iterator[Any]) -> Iterator[Any]:
         return value
+
+    if PYDANTIC_V2:
+        from pydantic import GetCoreSchemaHandler
+        from pydantic.json_schema import JsonSchemaValue
+        from pydantic_core import CoreSchema
+
+        @classmethod
+        def __get_pydantic_core_schema__(
+            cls,
+            source: Type[Any],  # pylint: disable=unused-argument
+            handler: "pydantic.GetCoreSchemaHandler",  # pylint: disable=unused-argument
+        ) -> "CoreSchema":
+            from pydantic_core import (  # pylint: disable=import-outside-toplevel
+                core_schema,
+            )
+
+            return core_schema.union_schema(
+                [
+                    core_schema.is_instance_schema(Iterator),
+                    core_schema.no_info_plain_validator_function(cls.validate),
+                ]
+            )
+
+        @classmethod
+        def __get_pydantic_json_schema__(
+            cls, core_schema: "CoreSchema", handler: "pydantic.GetJsonSchemaHandler"
+        ) -> "JsonSchemaValue":  # type: ignore # noqa: F821
+            json_schema = handler(core_schema)
+            json_schema.pop("allOf", None)
+            json_schema.update(_concatenate_iterator_schema)
+            return json_schema
+
+    else:
+
+        @classmethod
+        def __get_validators__(cls) -> Iterator[Any]:
+            yield cls.validate
+
+        @classmethod
+        def __modify_schema__(cls, field_schema: Dict[str, Any]) -> None:
+            """Defines what this type should be in openapi.json"""
+            field_schema.pop("allOf", None)
+            field_schema.update(_concatenate_iterator_schema)
+
+
+class AsyncConcatenateIterator(AsyncIterator[Item]):
+    @classmethod
+    def validate(cls, value: AsyncIterator[Any]) -> AsyncIterator[Any]:
+        return value
+
+    if PYDANTIC_V2:
+        from pydantic import GetCoreSchemaHandler
+        from pydantic.json_schema import JsonSchemaValue
+        from pydantic_core import CoreSchema
+
+        @classmethod
+        def __get_pydantic_core_schema__(
+            cls,
+            source: Type[Any],  # pylint: disable=unused-argument
+            handler: "pydantic.GetCoreSchemaHandler",  # pylint: disable=unused-argument
+        ) -> "CoreSchema":
+            from pydantic_core import (  # pylint: disable=import-outside-toplevel
+                core_schema,
+            )
+
+            return core_schema.union_schema(
+                [
+                    core_schema.is_instance_schema(AsyncIterator),
+                    core_schema.no_info_plain_validator_function(cls.validate),
+                ]
+            )
+
+        @classmethod
+        def __get_pydantic_json_schema__(
+            cls, core_schema: "CoreSchema", handler: "pydantic.GetJsonSchemaHandler"
+        ) -> "JsonSchemaValue":  # type: ignore # noqa: F821
+            json_schema = handler(core_schema)
+            json_schema.pop("allOf", None)
+            json_schema.update(_concatenate_iterator_schema)
+            return json_schema
+    else:
+
+        @classmethod
+        def __modify_schema__(cls, field_schema: Dict[str, Any]) -> None:
+            """Defines what this type should be in openapi.json"""
+            field_schema.pop("allOf", None)
+            field_schema.update(_concatenate_iterator_schema)
+
+        @classmethod
+        def __get_validators__(cls) -> Iterator[Any]:
+            yield cls.validate
+
+
+Weights = Union[File, Path, str]
+
+
+def get_filename_from_urlopen(resp: urllib.response.addinfourl) -> str:
+    mime_type = resp.headers.get_content_type()
+    extension = mimetypes.guess_extension(mime_type)
+    return ("file" + extension) if extension else "file"
 
 
 def _len_bytes(s: str, encoding: str = "utf-8") -> int:
@@ -295,5 +543,6 @@ def _truncate_filename_bytes(s: str, length: int, encoding: str = "utf-8") -> st
     and avoiding text encoding corruption from truncation.
     """
     root, ext = os.path.splitext(s.encode(encoding))
+    ext = ext.decode(encoding).split("?")[0].encode(encoding)
     root = root[: length - len(ext) - 1]
     return root.decode(encoding, "ignore") + "~" + ext.decode(encoding)

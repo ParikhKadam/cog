@@ -32,7 +32,7 @@ build:
     - "libglib2.0-0"
   python_version: "3.12"
   python_packages:
-    - "torch==2.2.1"
+    - "torch==2.3"
 predict: "predict.py:Predictor"
 ```
 
@@ -76,6 +76,16 @@ $ cog build -t my-colorization-model
 $ docker run -d -p 5000:5000 --gpus all my-colorization-model
 
 $ curl http://localhost:5000/predictions -X POST \
+    -H 'Content-Type: application/json' \
+    -d '{"input": {"image": "https://.../input.jpg"}}'
+```
+
+Or, combine build and run via the `serve` command:
+
+```console
+$ cog serve -p 8080
+
+$ curl http://localhost:8080/predictions -X POST \
     -H 'Content-Type: application/json' \
     -d '{"input": {"image": "https://.../input.jpg"}}'
 ```
@@ -149,6 +159,12 @@ Alternatively, you can build Cog from source and install it with these commands:
 ```console
 make
 sudo make install
+```
+
+Or if you are on docker:
+
+```
+RUN sh -c "INSTALL_DIR=\"/usr/local/bin\" SUDO=\"\" $(curl -fsSL https://cog.run/install.sh)"
 ```
 
 ## Upgrade
@@ -238,6 +254,7 @@ Thanks goes to these wonderful people ([emoji key](https://allcontributors.org/d
       <td align="center" valign="top" width="14.28%"><a href="https://github.com/one1zero1one"><img src="https://avatars.githubusercontent.com/u/724604?v=4?s=100" width="100px;" alt="Daniel Radu"/><br /><sub><b>Daniel Radu</b></sub></a><br /><a href="https://github.com/replicate/cog/commits?author=one1zero1one" title="Documentation">📖</a> <a href="https://github.com/replicate/cog/issues?q=author%3Aone1zero1one" title="Bug reports">🐛</a></td>
       <td align="center" valign="top" width="14.28%"><a href="https://github.com/Etelis"><img src="https://avatars.githubusercontent.com/u/92247226?v=4?s=100" width="100px;" alt="Itay Etelis"/><br /><sub><b>Itay Etelis</b></sub></a><br /><a href="https://github.com/replicate/cog/commits?author=Etelis" title="Code">💻</a></td>
       <td align="center" valign="top" width="14.28%"><a href="http://www.wavefunction.dev"><img src="https://avatars.githubusercontent.com/u/54407820?v=4?s=100" width="100px;" alt="Gennaro Schiano"/><br /><sub><b>Gennaro Schiano</b></sub></a><br /><a href="https://github.com/replicate/cog/commits?author=gschian0" title="Documentation">📖</a></td>
+      <td align="center" valign="top" width="14.28%"><a href="http://andreknoerig.de"><img src="https://avatars.githubusercontent.com/u/481350?v=4?s=100" width="100px;" alt="André Knörig"/><br /><sub><b>André Knörig</b></sub></a><br /><a href="https://github.com/replicate/cog/commits?author=aknoerig" title="Documentation">📖</a></td>
     </tr>
   </tbody>
 </table>

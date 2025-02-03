@@ -3,9 +3,12 @@ import io
 import time
 import unittest.mock as mock
 
+import pytest
 import responses
 from PIL import Image
 from responses import matchers
+
+from cog.types import PYDANTIC_V2
 
 from .conftest import (
     make_client,
@@ -13,6 +16,24 @@ from .conftest import (
     uses_predictor_with_client_options,
     uses_trainer,
 )
+
+
+def test_index_document():
+    client = make_client(fixture_name="slow_setup")
+    resp = client.get("/")
+    data = resp.json()
+    for field in (
+        "cog_version",
+        "docs_url",
+        "openapi_url",
+        "shutdown_url",
+        "healthcheck_url",
+        "predictions_url",
+        "predictions_idempotent_url",
+        "predictions_cancel_url",
+    ):
+        assert field in data
+        assert data[field] is not None
 
 
 def test_setup_healthcheck():
@@ -370,6 +391,33 @@ def test_train_openapi_specification(client):
     }
 
 
+@pytest.mark.skipif(
+    not PYDANTIC_V2,
+    reason="Literal is used for enums only in Pydantic v2",
+)
+@uses_predictor("input_literal")
+def test_openapi_specification_with_literal(client, static_schema):
+    resp = client.get("/openapi.json")
+    assert resp.status_code == 200
+
+    schema = resp.json()
+    assert schema["openapi"] == "3.0.2"
+    assert schema["info"] == {"title": "Cog", "version": "0.1.0"}
+
+    schemas = schema["components"]["schemas"]
+
+    assert schemas["Input"]["properties"]["text"] == {
+        "allOf": [{"$ref": "#/components/schemas/text"}],
+        "x-order": 0,
+    }
+    assert schemas["text"] == {
+        "description": "An enumeration.",
+        "enum": ["foo", "bar"],
+        "title": "text",
+        "type": "string",
+    }
+
+
 @uses_predictor("yield_strings")
 def test_yielding_strings_from_generator_predictors(client, match):
     resp = client.post("/predictions")
@@ -521,10 +569,13 @@ def test_asynchronous_prediction_endpoint(client, match):
     )
     assert resp.status_code == 202
 
-    assert resp.json() == match(
-        {"status": "processing", "output": None, "started_at": mock.ANY}
-    )
-    assert resp.json()["started_at"] is not None
+    result = resp.json()
+
+    # The response might be a "processing" response, but the prediction can
+    # also complete before the response is sent.
+    assert result["started_at"] is not None
+    assert result["status"] in {"processing", "succeeded"}
+    assert result["output"] in {None, "hello world"}
 
     n = 0
     while webhook.call_count < 1 and n < 10:
@@ -589,10 +640,13 @@ def test_asynchronous_prediction_endpoint_with_trace_context(client, match):
     )
     assert resp.status_code == 202
 
-    assert resp.json() == match(
-        {"status": "processing", "output": None, "started_at": mock.ANY}
-    )
-    assert resp.json()["started_at"] is not None
+    result = resp.json()
+
+    # The response might be a "processing" response, but the prediction can
+    # also complete before the response is sent.
+    assert result["started_at"] is not None
+    assert result["status"] in {"processing", "succeeded"}
+    assert result["output"] in {None, "https://example.com/upload/file"}
 
     n = 0
     while webhook.call_count < 1 and n < 10:

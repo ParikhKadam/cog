@@ -13,11 +13,16 @@ import (
 	"github.com/replicate/cog/pkg/util/console"
 )
 
-func Build(dir, dockerfile, imageName string, secrets []string, noCache bool, progressOutput string, epoch int64) error {
+func Build(dir, dockerfileContents, imageName string, secrets []string, noCache bool, progressOutput string, epoch int64) error {
 	var args []string
 
+	userCache, err := UserCache()
+	if err != nil {
+		return err
+	}
+
 	args = append(args,
-		"buildx", "build",
+		"buildx", "build", "--build-context", "usercache="+userCache,
 	)
 
 	if util.IsAppleSiliconMac(runtime.GOOS, runtime.GOARCH) {
@@ -65,7 +70,7 @@ func Build(dir, dockerfile, imageName string, secrets []string, noCache bool, pr
 	cmd.Dir = dir
 	cmd.Stdout = os.Stderr // redirect stdout to stderr - build output is all messaging
 	cmd.Stderr = os.Stderr
-	cmd.Stdin = strings.NewReader(dockerfile)
+	cmd.Stdin = strings.NewReader(dockerfileContents)
 
 	console.Debug("$ " + strings.Join(cmd.Args, " "))
 	return cmd.Run()

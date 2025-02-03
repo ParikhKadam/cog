@@ -13,47 +13,68 @@ import (
 
 func TestValidateModelPythonVersion(t *testing.T) {
 	testCases := []struct {
-		name        string
-		input       string
-		expectedErr bool
+		name           string
+		pythonVersion  string
+		concurrencyMax int
+		expectedErr    string
 	}{
 		{
-			name:        "ValidVersion",
-			input:       "3.12",
-			expectedErr: false,
+			name:          "ValidVersion",
+			pythonVersion: "3.12",
 		},
 		{
-			name:        "MinimumVersion",
-			input:       "3.8",
-			expectedErr: false,
+			name:          "MinimumVersion",
+			pythonVersion: "3.8",
 		},
 		{
-			name:        "FullyQualifiedVersion",
-			input:       "3.12.1",
-			expectedErr: false,
+			name:           "MinimumVersionForConcurrency",
+			pythonVersion:  "3.11",
+			concurrencyMax: 5,
 		},
 		{
-			name:        "InvalidFormat",
-			input:       "3-12",
-			expectedErr: true,
+			name:           "TooOldForConcurrency",
+			pythonVersion:  "3.8",
+			concurrencyMax: 5,
+			expectedErr:    "when concurrency.max is set, minimum supported Python version is 3.11. requested 3.8",
 		},
 		{
-			name:        "InvalidMissingMinor",
-			input:       "3",
-			expectedErr: true,
+			name:          "FullyQualifiedVersion",
+			pythonVersion: "3.12.1",
 		},
 		{
-			name:        "LessThanMinimum",
-			input:       "3.7",
-			expectedErr: true,
+			name:          "InvalidFormat",
+			pythonVersion: "3-12",
+			expectedErr:   "invalid Python version format: missing minor version in 3-12",
+		},
+		{
+			name:          "InvalidMissingMinor",
+			pythonVersion: "3",
+			expectedErr:   "invalid Python version format: missing minor version in 3",
+		},
+		{
+			name:          "LessThanMinimum",
+			pythonVersion: "3.7",
+			expectedErr:   "minimum supported Python version is 3.8. requested 3.7",
 		},
 	}
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			err := ValidateModelPythonVersion(tc.input)
-			if tc.expectedErr {
-				require.Error(t, err)
+			cfg := &Config{
+				Build: &Build{
+					PythonVersion: tc.pythonVersion,
+				},
+			}
+			if tc.concurrencyMax != 0 {
+				// the Concurrency key is optional, only populate it if
+				// concurrencyMax is a non-default value
+				cfg.Concurrency = &Concurrency{
+					Max: tc.concurrencyMax,
+				}
+			}
+			err := ValidateModelPythonVersion(cfg)
+			if tc.expectedErr != "" {
+				require.ErrorContains(t, err, tc.expectedErr)
 			} else {
 				require.NoError(t, err)
 			}
@@ -167,8 +188,8 @@ foo==1.0.0`), 0o644)
 	requirements, err := config.PythonRequirementsForArch("", "", []string{})
 	require.NoError(t, err)
 	expected := `--find-links https://download.pytorch.org/whl/torch_stable.html
-torch==1.7.1+cu110
-torchvision==0.8.2+cu110
+torch==1.7.1
+torchvision==0.8.2
 torchaudio==0.7.2
 foo==1.0.0`
 	require.Equal(t, expected, requirements)
@@ -197,8 +218,8 @@ foo==1.0.0`), 0o644)
 	requirements, err := config.PythonRequirementsForArch("", "", []string{})
 	require.NoError(t, err)
 	expected := `--extra-index-url https://download.pytorch.org/whl/cu116
-torch==1.12.1+cu116
-torchvision==0.13.1+cu116
+torch==1.12.1
+torchvision==0.13.1
 torchaudio==0.12.1
 foo==1.0.0`
 	require.Equal(t, expected, requirements)
@@ -406,8 +427,8 @@ func TestPythonPackagesForArchTorchGPU(t *testing.T) {
 	requirements, err := config.PythonRequirementsForArch("", "", []string{})
 	require.NoError(t, err)
 	expected := `--find-links https://download.pytorch.org/whl/torch_stable.html
-torch==1.7.1+cu110
-torchvision==0.8.2+cu110
+torch==1.7.1
+torchvision==0.8.2
 torchaudio==0.7.2
 foo==1.0.0`
 	require.Equal(t, expected, requirements)
@@ -491,7 +512,7 @@ func TestPythonPackagesBothTorchAndTensorflow(t *testing.T) {
 	require.NoError(t, err)
 	expected := `--extra-index-url https://download.pytorch.org/whl/cu121
 tensorflow==2.16.1
-torch==2.3.1+cu121`
+torch==2.3.1`
 	require.Equal(t, expected, requirements)
 }
 
@@ -649,48 +670,26 @@ func TestBlankBuild(t *testing.T) {
 	require.Equal(t, false, config.Build.GPU)
 }
 
-func TestModelPythonVersionValidation(t *testing.T) {
-	err := ValidateModelPythonVersion("3.8")
-	require.NoError(t, err)
-	err = ValidateModelPythonVersion("3.8.1")
-	require.NoError(t, err)
-	err = ValidateModelPythonVersion("3.7")
-	require.Equal(t, "minimum supported Python version is 3.8. requested 3.7", err.Error())
-	err = ValidateModelPythonVersion("3.7.1")
-	require.Equal(t, "minimum supported Python version is 3.8. requested 3.7.1", err.Error())
-}
-
-func TestSplitPinnedPythonRequirement(t *testing.T) {
-	testCases := []struct {
-		input                  string
-		expectedName           string
-		expectedVersion        string
-		expectedFindLinks      []string
-		expectedExtraIndexURLs []string
-		expectedError          bool
-	}{
-		{"package1==1.0.0", "package1", "1.0.0", nil, nil, false},
-		{"package1==1.0.0+alpha", "package1", "1.0.0+alpha", nil, nil, false},
-		{"--find-links=link1 --find-links=link2 package3==3.0.0", "package3", "3.0.0", []string{"link1", "link2"}, nil, false},
-		{"package4==4.0.0 --extra-index-url=url1 --extra-index-url=url2", "package4", "4.0.0", nil, []string{"url1", "url2"}, false},
-		{"-f link1 --find-links=link2 package5==5.0.0 --extra-index-url=url1 --extra-index-url=url2", "package5", "5.0.0", []string{"link1", "link2"}, []string{"url1", "url2"}, false},
-		{"package6 --find-links=link1 --find-links=link2 --extra-index-url=url1 --extra-index-url=url2", "", "", nil, nil, true},
-		{"invalid package", "", "", nil, nil, true},
-		{"package8==", "", "", nil, nil, true},
-		{"==8.0.0", "", "", nil, nil, true},
+func TestPythonRequirementsForArchWithAddedPackage(t *testing.T) {
+	config := &Config{
+		Build: &Build{
+			GPU:           true,
+			PythonVersion: "3.8",
+			PythonPackages: []string{
+				"torch==2.4.0 --extra-index-url=https://download.pytorch.org/whl/cu116",
+			},
+			CUDA: "11.6.2",
+		},
 	}
-
-	for _, tc := range testCases {
-		name, version, findLinks, extraIndexURLs, err := splitPinnedPythonRequirement(tc.input)
-
-		if tc.expectedError {
-			require.Error(t, err)
-		} else {
-			require.NoError(t, err)
-			require.Equal(t, tc.expectedName, name, "input: "+tc.input)
-			require.Equal(t, tc.expectedVersion, version, "input: "+tc.input)
-			require.Equal(t, tc.expectedFindLinks, findLinks, "input: "+tc.input)
-			require.Equal(t, tc.expectedExtraIndexURLs, extraIndexURLs, "input: "+tc.input)
-		}
-	}
+	err := config.ValidateAndComplete("")
+	require.NoError(t, err)
+	require.Equal(t, "11.6.2", config.Build.CUDA)
+	requirements, err := config.PythonRequirementsForArch("", "", []string{
+		"torchvision==2.4.0",
+	})
+	require.NoError(t, err)
+	expected := `--extra-index-url https://download.pytorch.org/whl/cu116
+torch==2.4.0
+torchvision==2.4.0`
+	require.Equal(t, expected, requirements)
 }

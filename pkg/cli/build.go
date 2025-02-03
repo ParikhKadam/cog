@@ -22,6 +22,11 @@ var buildSchemaFile string
 var buildUseCudaBaseImage string
 var buildDockerfileFile string
 var buildUseCogBaseImage bool
+var buildStrip bool
+var buildPrecompile bool
+var buildFast bool
+
+const useCogBaseImageFlagKey = "use-cog-base-image"
 
 func newBuildCommand() *cobra.Command {
 	cmd := &cobra.Command{
@@ -40,6 +45,9 @@ func newBuildCommand() *cobra.Command {
 	addDockerfileFlag(cmd)
 	addUseCogBaseImageFlag(cmd)
 	addBuildTimestampFlag(cmd)
+	addStripFlag(cmd)
+	addPrecompileFlag(cmd)
+	addFastFlag(cmd)
 	cmd.Flags().StringVarP(&buildTag, "tag", "t", "", "A name for the built image in the form 'repository:tag'")
 	return cmd
 }
@@ -58,12 +66,12 @@ func buildCommand(cmd *cobra.Command, args []string) error {
 		imageName = config.DockerImageName(projectDir)
 	}
 
-	err = config.ValidateModelPythonVersion(cfg.Build.PythonVersion)
+	err = config.ValidateModelPythonVersion(cfg)
 	if err != nil {
 		return err
 	}
 
-	if err := image.Build(cfg, projectDir, imageName, buildSecrets, buildNoCache, buildSeparateWeights, buildUseCudaBaseImage, buildProgressOutput, buildSchemaFile, buildDockerfileFile, buildUseCogBaseImage); err != nil {
+	if err := image.Build(cfg, projectDir, imageName, buildSecrets, buildNoCache, buildSeparateWeights, buildUseCudaBaseImage, buildProgressOutput, buildSchemaFile, buildDockerfileFile, DetermineUseCogBaseImage(cmd), buildStrip, buildPrecompile, buildFast); err != nil {
 		return err
 	}
 
@@ -110,7 +118,7 @@ func addDockerfileFlag(cmd *cobra.Command) {
 }
 
 func addUseCogBaseImageFlag(cmd *cobra.Command) {
-	cmd.Flags().BoolVar(&buildUseCogBaseImage, "use-cog-base-image", false, "Use pre-built Cog base image for faster cold boots")
+	cmd.Flags().BoolVar(&buildUseCogBaseImage, useCogBaseImageFlagKey, true, "Use pre-built Cog base image for faster cold boots")
 }
 
 func addBuildTimestampFlag(cmd *cobra.Command) {
@@ -118,8 +126,26 @@ func addBuildTimestampFlag(cmd *cobra.Command) {
 	_ = cmd.Flags().MarkHidden("timestamp")
 }
 
+func addStripFlag(cmd *cobra.Command) {
+	const stripFlag = "strip"
+	cmd.Flags().BoolVar(&buildStrip, stripFlag, false, "Whether to strip shared libraries for faster inference times")
+	_ = cmd.Flags().MarkHidden(stripFlag)
+}
+
+func addPrecompileFlag(cmd *cobra.Command) {
+	const precompileFlag = "precompile"
+	cmd.Flags().BoolVar(&buildPrecompile, precompileFlag, false, "Whether to precompile python files for faster load times")
+	_ = cmd.Flags().MarkHidden(precompileFlag)
+}
+
+func addFastFlag(cmd *cobra.Command) {
+	const fastFlag = "x-fast"
+	cmd.Flags().BoolVar(&buildFast, fastFlag, false, "Whether to use the experimental fast features")
+	_ = cmd.Flags().MarkHidden(fastFlag)
+}
+
 func checkMutuallyExclusiveFlags(cmd *cobra.Command, args []string) error {
-	flags := []string{"use-cog-base-image", "use-cuda-base-image", "dockerfile"}
+	flags := []string{useCogBaseImageFlagKey, "use-cuda-base-image", "dockerfile"}
 	var flagsSet []string
 	for _, flag := range flags {
 		if cmd.Flag(flag).Changed {
@@ -130,4 +156,13 @@ func checkMutuallyExclusiveFlags(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("The flags %s are mutually exclusive: you can only set one of them.", strings.Join(flagsSet, " and "))
 	}
 	return nil
+}
+
+func DetermineUseCogBaseImage(cmd *cobra.Command) *bool {
+	if !cmd.Flags().Changed(useCogBaseImageFlagKey) {
+		return nil
+	}
+	useCogBaseImage := new(bool)
+	*useCogBaseImage = buildUseCogBaseImage
+	return useCogBaseImage
 }

@@ -36,9 +36,10 @@ func newRunCommand() *cobra.Command {
 	addUseCudaBaseImageFlag(cmd)
 	addUseCogBaseImageFlag(cmd)
 	addGpusFlag(cmd)
+	addFastFlag(cmd)
 
 	flags := cmd.Flags()
-	// Flags after first argment are considered args and passed to command
+	// Flags after first argument are considered args and passed to command
 
 	// This is called `publish` for consistency with `docker run`
 	cmd.Flags().StringArrayVarP(&runPorts, "publish", "p", []string{}, "Publish a container's port to the host, e.g. -p 8000")
@@ -54,7 +55,7 @@ func run(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	imageName, err := image.BuildBase(cfg, projectDir, buildUseCudaBaseImage, buildUseCogBaseImage, buildProgressOutput)
+	imageName, err := image.BuildBase(cfg, projectDir, buildUseCudaBaseImage, DetermineUseCogBaseImage(cmd), buildProgressOutput)
 	if err != nil {
 		return err
 	}
@@ -90,6 +91,10 @@ func run(cmd *cobra.Command, args []string) error {
 
 	console.Info("")
 	console.Infof("Running '%s' in Docker with the current directory mounted as a volume...", strings.Join(args, " "))
+
+	if buildFast {
+		console.Info("Fast run enabled.")
+	}
 
 	err = docker.Run(runOptions)
 	// Only retry if we're using a GPU but but the user didn't explicitly select a GPU with --gpus

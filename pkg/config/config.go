@@ -21,6 +21,7 @@ import (
 var (
 	BuildSourceEpochTimestamp int64 = -1
 	BuildXCachePath           string
+	PipPackageNameRegex       = regexp.MustCompile(`^([^>=<~ \n[#]+)`)
 )
 
 // TODO(andreas): support conda packages
@@ -29,9 +30,10 @@ var (
 // TODO(andreas): suggest valid torchvision versions (e.g. if the user wants to use 0.8.0, suggest 0.8.1)
 
 const (
-	MinimumMajorPythonVersion int = 3
-	MinimumMinorPythonVersion int = 8
-	MinimumMajorCudaVersion   int = 11
+	MinimumMajorPythonVersion               int = 3
+	MinimumMinorPythonVersion               int = 8
+	MinimumMinorPythonVersionForConcurrency int = 11
+	MinimumMajorCudaVersion                 int = 11
 )
 
 type RunItem struct {
@@ -57,16 +59,21 @@ type Build struct {
 	pythonRequirementsContent []string
 }
 
+type Concurrency struct {
+	Max int `json:"max,omitempty" yaml:"max"`
+}
+
 type Example struct {
 	Input  map[string]string `json:"input" yaml:"input"`
 	Output string            `json:"output" yaml:"output"`
 }
 
 type Config struct {
-	Build   *Build `json:"build" yaml:"build"`
-	Image   string `json:"image,omitempty" yaml:"image"`
-	Predict string `json:"predict,omitempty" yaml:"predict"`
-	Train   string `json:"train,omitempty" yaml:"train"`
+	Build       *Build       `json:"build" yaml:"build"`
+	Image       string       `json:"image,omitempty" yaml:"image"`
+	Predict     string       `json:"predict,omitempty" yaml:"predict"`
+	Train       string       `json:"train,omitempty" yaml:"train"`
+	Concurrency *Concurrency `json:"concurrency,omitempty" yaml:"concurrency"`
 }
 
 func DefaultConfig() *Config {
@@ -181,6 +188,10 @@ func (c *Config) TorchvisionVersion() (string, bool) {
 	return c.pythonPackageVersion("torchvision")
 }
 
+func (c *Config) TorchaudioVersion() (string, bool) {
+	return c.pythonPackageVersion("torchaudio")
+}
+
 func (c *Config) TensorFlowVersion() (string, bool) {
 	return c.pythonPackageVersion("tensorflow")
 }
@@ -209,7 +220,7 @@ func (c *Config) cudaFromTF() (tfVersion string, tfCUDA string, tfCuDNN string, 
 
 func (c *Config) pythonPackageVersion(name string) (version string, ok bool) {
 	for _, pkg := range c.Build.pythonRequirementsContent {
-		pkgName, version, _, _, err := splitPinnedPythonRequirement(pkg)
+		pkgName, version, _, _, err := SplitPinnedPythonRequirement(pkg)
 		if err != nil {
 			// package is not in package==version format
 			continue
@@ -239,7 +250,9 @@ func splitPythonVersion(version string) (major int, minor int, err error) {
 	return major, minor, nil
 }
 
-func ValidateModelPythonVersion(version string) error {
+func ValidateModelPythonVersion(cfg *Config) error {
+	version := cfg.Build.PythonVersion
+
 	// we check for minimum supported here
 	major, minor, err := splitPythonVersion(version)
 	if err != nil {
@@ -249,6 +262,10 @@ func ValidateModelPythonVersion(version string) error {
 		minor < MinimumMinorPythonVersion) {
 		return fmt.Errorf("minimum supported Python version is %d.%d. requested %s",
 			MinimumMajorPythonVersion, MinimumMinorPythonVersion, version)
+	}
+	if cfg.Concurrency != nil && cfg.Concurrency.Max > 1 && minor < MinimumMinorPythonVersionForConcurrency {
+		return fmt.Errorf("when concurrency.max is set, minimum supported Python version is %d.%d. requested %s",
+			MinimumMajorPythonVersion, MinimumMinorPythonVersionForConcurrency, version)
 	}
 	return nil
 }
@@ -307,15 +324,22 @@ func (c *Config) ValidateAndComplete(projectDir string) error {
 }
 
 // PythonRequirementsForArch returns a requirements.txt file with all the GPU packages resolved for given OS and architecture.
-func (c *Config) PythonRequirementsForArch(goos string, goarch string, excludePackages []string) (string, error) {
+func (c *Config) PythonRequirementsForArch(goos string, goarch string, includePackages []string) (string, error) {
 	packages := []string{}
 	findLinksSet := map[string]bool{}
 	extraIndexURLSet := map[string]bool{}
-	for _, pkg := range c.Build.pythonRequirementsContent {
-		if slices.ContainsString(excludePackages, pkg) {
-			continue
-		}
 
+	includePackageNames := []string{}
+	for _, pkg := range includePackages {
+		packageName, err := PackageName(pkg)
+		if err != nil {
+			return "", err
+		}
+		includePackageNames = append(includePackageNames, packageName)
+	}
+
+	// Include all the requirements and remove our include packages if they exist
+	for _, pkg := range c.Build.pythonRequirementsContent {
 		archPkg, findLinksList, extraIndexURLs, err := c.pythonPackageForArch(pkg, goos, goarch)
 		if err != nil {
 			return "", err
@@ -331,7 +355,25 @@ func (c *Config) PythonRequirementsForArch(goos string, goarch string, excludePa
 				extraIndexURLSet[u] = true
 			}
 		}
+
+		packageName, _ := PackageName(archPkg)
+		if packageName != "" {
+			foundIdx := -1
+			for i, includePkg := range includePackageNames {
+				if includePkg == packageName {
+					foundIdx = i
+					break
+				}
+			}
+			if foundIdx != -1 {
+				includePackageNames = append(includePackageNames[:foundIdx], includePackageNames[foundIdx+1:]...)
+				includePackages = append(includePackages[:foundIdx], includePackages[foundIdx+1:]...)
+			}
+		}
 	}
+
+	// If we still have some include packages add them in
+	packages = append(packages, includePackages...)
 
 	// Create final requirements.txt output
 	// Put index URLs first
@@ -352,7 +394,7 @@ func (c *Config) PythonRequirementsForArch(goos string, goarch string, excludePa
 // pythonPackageForArch takes a package==version line and
 // returns a package==version and index URL resolved to the correct GPU package for the given OS and architecture
 func (c *Config) pythonPackageForArch(pkg, goos, goarch string) (actualPackage string, findLinksList []string, extraIndexURLs []string, err error) {
-	name, version, findLinksList, extraIndexURLs, err := splitPinnedPythonRequirement(pkg)
+	name, version, findLinksList, extraIndexURLs, err := SplitPinnedPythonRequirement(pkg)
 	if err != nil {
 		// It's not pinned, so just return the line verbatim
 		return pkg, []string{}, []string{}, nil
@@ -522,50 +564,6 @@ Compatible cuDNN version is: %s`, c.Build.CuDNN, tfVersion, tfCuDNN)
 	}
 
 	return nil
-}
-
-// splitPythonPackage returns the name, version, findLinks, and extraIndexURLs from a requirements.txt line
-// in the form name==version [--find-links=<findLink>] [-f <findLink>] [--extra-index-url=<extraIndexURL>]
-func splitPinnedPythonRequirement(requirement string) (name string, version string, findLinks []string, extraIndexURLs []string, err error) {
-	pinnedPackageRe := regexp.MustCompile(`(?:([a-zA-Z0-9\-_]+)==([^ ]+)|--find-links=([^\s]+)|-f\s+([^\s]+)|--extra-index-url=([^\s]+))`)
-
-	matches := pinnedPackageRe.FindAllStringSubmatch(requirement, -1)
-	if matches == nil {
-		return "", "", nil, nil, fmt.Errorf("Package %s is not in the expected format", requirement)
-	}
-
-	nameFound := false
-	versionFound := false
-
-	for _, match := range matches {
-		if match[1] != "" {
-			name = match[1]
-			nameFound = true
-		}
-
-		if match[2] != "" {
-			version = match[2]
-			versionFound = true
-		}
-
-		if match[3] != "" {
-			findLinks = append(findLinks, match[3])
-		}
-
-		if match[4] != "" {
-			findLinks = append(findLinks, match[4])
-		}
-
-		if match[5] != "" {
-			extraIndexURLs = append(extraIndexURLs, match[5])
-		}
-	}
-
-	if !nameFound || !versionFound {
-		return "", "", nil, nil, fmt.Errorf("Package name or version is missing in %s", requirement)
-	}
-
-	return name, version, findLinks, extraIndexURLs, nil
 }
 
 func sliceContains(slice []string, s string) bool {
